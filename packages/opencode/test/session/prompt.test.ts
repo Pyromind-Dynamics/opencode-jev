@@ -57,6 +57,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { Reflex } from "../../src/reflex"
+import { ReflexTest } from "../reflex/server"
+import { Global } from "@opencode-ai/core/global"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -169,6 +172,7 @@ const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 
 const promptRoot = LayerNode.group([
+  Reflex.node,
   SessionPrompt.node,
   Session.node,
   SessionProjector.node,
@@ -441,6 +445,341 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   const chat = yield* sessions.create(input ?? { title: "Pinned" })
   return { prompt, run, sessions, chat }
 })
+
+const setupReflex = Effect.fn("test.setupReflex")(function* (options?: Parameters<typeof ReflexTest.server>[0]) {
+  const http = yield* Effect.acquireRelease(
+    Effect.sync(() => ReflexTest.server(options)),
+    (http) => Effect.sync(() => http.stop()),
+  )
+  const env = yield* Env.Service
+  const { llm } = yield* useServerConfig(providerCfg)
+  yield* Effect.forEach(Object.entries(ReflexTest.environment(http.url, llm.url)), ([key, value]) =>
+    env.set(key, value),
+  )
+  const sessions = yield* Session.Service
+  const prompt = yield* SessionPrompt.Service
+  const chat = yield* sessions.create({ title: "Reflex test" })
+  return { http, llm, env, sessions, prompt, chat }
+})
+
+for (const agent of ["build", "plan"] as const) {
+  it.instance(`reflex routes to the real ${agent} agent and configured model`, () =>
+    Effect.gen(function* () {
+      const { http, llm, prompt, sessions, chat } = yield* setupReflex({ agent, tier: "strong" })
+      yield* llm.text("Completed requested deliverable")
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "reflex",
+        parts: [{ type: "text", text: agent === "plan" ? "Explain this repository" : "Implement a small fix" }],
+      })
+      expect(result.info).toMatchObject({ role: "assistant", agent, modelID: "strong", providerID: "reflex" })
+      expect((yield* llm.hits)[0].body.model).toBe("strong-model")
+      const history = yield* sessions.messages({ sessionID: chat.id })
+      expect(history.find((item) => item.info.role === "user")?.info.agent).toBe("reflex")
+      expect(Reflex.task(yield* sessions.get(chat.id))).toMatchObject({
+        agent,
+        tier: "strong",
+        turns: 1,
+        corrections: 0,
+      })
+      expect(http.requests).toHaveLength(2)
+      expect(JSON.stringify(http.requests)).not.toContain("jev-test-secret")
+      const log = yield* Effect.promise(() =>
+        Bun.file(path.join(Global.Path.data, "reflex", `${chat.id}.jsonl`)).text(),
+      )
+      expect(log).toContain('"decision_kind":"llm"')
+      expect(log).toContain('"cost":null')
+      expect(log).toContain('"verification":"unknown"')
+      expect(log).not.toContain("jev-test-secret")
+      expect(log).not.toContain("llm-test-secret")
+      const calls = http.requests.length
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(http.requests).toHaveLength(calls)
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  )
+}
+
+it.instance("reflex corrects at most twice, upgrades on replan and resumes without duplicate feedback", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, sessions, chat } = yield* setupReflex({ actions: ["retry", "replan", "retry"] })
+    yield* llm.text("First attempt")
+    yield* llm.text("Second attempt")
+    yield* llm.text("Third attempt")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Fix the bug" }] })
+    const value = Reflex.task(yield* sessions.get(chat.id))
+    expect(value).toMatchObject({ turns: 3, corrections: 2, tier: "normal" })
+    expect((yield* llm.hits).map((hit) => hit.body.model)).toEqual(["small-model", "small-model", "normal-model"])
+    const before = yield* sessions.messages({ sessionID: chat.id })
+    expect(before.filter((item) => item.info.role === "user")).toHaveLength(3)
+    expect(
+      before.flatMap((item) => item.parts).filter((part) => part.type === "text" && part.metadata?.reflex),
+    ).toHaveLength(2)
+    const calls = http.requests.length
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(http.requests).toHaveLength(calls)
+    expect(yield* llm.hits).toHaveLength(3)
+  }),
+)
+
+it.instance("reflex evaluates structured output and does not repeat completed output on resume", () =>
+  Effect.gen(function* () {
+    const { llm, sessions, prompt, chat } = yield* setupReflex({ actions: ["retry", "finish"] })
+    yield* llm.tool("StructuredOutput", { answer: "partial" })
+    yield* llm.tool("StructuredOutput", { answer: "complete" })
+    const result = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      format: new SessionV1.OutputFormatJsonSchema({
+        type: "json_schema",
+        retryCount: 2,
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      }),
+      parts: [{ type: "text", text: "Return an answer as JSON" }],
+    })
+    expect(result.info).toMatchObject({ structured: { answer: "complete" } })
+    expect(Reflex.task(yield* sessions.get(chat.id))).toMatchObject({ corrections: 1, turns: 2 })
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("reflex provider budget prevents corrective turns", () =>
+  Effect.gen(function* () {
+    const { llm, env, prompt, sessions, chat } = yield* setupReflex({ actions: ["retry"] })
+    yield* env.set("REFLEX_MAX_PROVIDER_TURNS", "1")
+    yield* llm.text("Incomplete result")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      parts: [{ type: "text", text: "Implement the feature" }],
+    })
+    expect(Reflex.task(yield* sessions.get(chat.id))).toMatchObject({ turns: 1, corrections: 0 })
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("reflex mode can be left by selecting build without further Jev requests", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, chat } = yield* setupReflex()
+    yield* llm.text("First task complete")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Do task one" }] })
+    const calls = http.requests.length
+    yield* llm.text("Manual task complete")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "Do task two" }],
+    })
+    expect(http.requests).toHaveLength(calls)
+  }),
+)
+
+unix("reflex auto-allows only this tool call and does not reroute a tool continuation", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, sessions, chat } = yield* setupReflex()
+    yield* sessions.setPermission({
+      sessionID: chat.id,
+      permission: [{ permission: "bash", pattern: "*", action: "ask" }],
+    })
+    yield* llm.tool("bash", { command: "echo reflex", description: "Print a local string" })
+    yield* llm.text("Done")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Run echo reflex" }] })
+    const history = yield* sessions.messages({ sessionID: chat.id })
+    const tools = history.flatMap((item) => item.parts).filter((part) => part.type === "tool")
+    expect(tools).toHaveLength(1)
+    expect(tools[0].state.status).toBe("completed")
+    expect(http.requests.filter((request) => request.questions.agent)).toHaveLength(1)
+    const gate = http.requests.find((request) => request.questions.action && !request.questions.quality)
+    expect(gate?.state).toMatchObject({ tool: { name: "bash", arguments: { command: "echo reflex" } } })
+    expect(Reflex.task(yield* sessions.get(chat.id))?.turns).toBe(2)
+    expect((yield* sessions.get(chat.id)).permission?.[0].action).toBe("ask")
+  }),
+)
+
+unix("reflex low confidence keeps the existing human permission request", () =>
+  Effect.gen(function* () {
+    const { llm, prompt, sessions, chat, env } = yield* setupReflex({ confidence: 0.5 })
+    yield* env.set("REFLEX_ROUTE_CONFIDENCE", "0.4")
+    const permissions = yield* Permission.Service
+    yield* sessions.setPermission({
+      sessionID: chat.id,
+      permission: [{ permission: "bash", pattern: "*", action: "ask" }],
+    })
+    yield* llm.tool("bash", { command: "echo waiting", description: "Print a local string" })
+    const fiber = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Run echo waiting" }] })
+      .pipe(Effect.forkChild)
+    const pending = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const pending = yield* permissions.list()
+        return pending.length ? pending[0] : undefined
+      }),
+      "Reflex did not preserve permission confirmation",
+      "5 seconds",
+    )
+    expect(pending.sessionID).toBe(chat.id)
+    yield* permissions.reply({ requestID: pending.id, reply: "reject" })
+    yield* Fiber.join(fiber)
+    expect(yield* permissions.list()).toHaveLength(0)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("reflex low confidence falls back to plan and normal", () =>
+  Effect.gen(function* () {
+    const { llm, prompt, sessions, chat } = yield* setupReflex({ confidence: 0.2, agent: "build", tier: "strong" })
+    yield* llm.text("Plan draft")
+    const result = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      parts: [{ type: "text", text: "Consider a change" }],
+    })
+    expect(result.info).toMatchObject({ agent: "plan", modelID: "normal" })
+    expect(Reflex.task(yield* sessions.get(chat.id))?.corrections).toBe(0)
+  }),
+)
+
+it.instance("reflex hard deny never calls Jev for permission", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, chat } = yield* setupReflex()
+    const permissions = yield* Permission.Service
+    yield* llm.text("Done")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Review this task" }] })
+    const count = http.requests.length
+    const result = yield* permissions
+      .ask({
+        sessionID: chat.id,
+        permission: "bash",
+        patterns: ["safe", "unsafe"],
+        always: [],
+        metadata: {},
+        ruleset: [
+          { permission: "bash", pattern: "safe", action: "ask" },
+          { permission: "bash", pattern: "unsafe", action: "deny" },
+        ],
+      })
+      .pipe(Effect.result)
+    expect(result._tag).toBe("Failure")
+    expect(http.requests).toHaveLength(count)
+  }),
+)
+
+it.instance("reflex ignores a late routing decision after a newer user input", () =>
+  Effect.gen(function* () {
+    const wait = defer<void>()
+    const { http, prompt, sessions, chat } = yield* setupReflex({ wait: wait.promise })
+    const reflex = yield* Reflex.Service
+    const first = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      noReply: true,
+      parts: [{ type: "text", text: "First task" }],
+    })
+    if (first.info.role !== "user") throw new Error("Expected user")
+    const fiber = yield* reflex.start(chat.id, first.info, [first]).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.sync(() => (http.requests.length ? true : undefined)),
+      "Jev not requested",
+      "3 seconds",
+    )
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "Replacement task" }],
+    })
+    wait.resolve()
+    expect(yield* Fiber.join(fiber)).toBeUndefined()
+    expect(Reflex.task(yield* sessions.get(chat.id))).toBeUndefined()
+  }),
+)
+
+it.instance("reflex subagents inherit permission review without their own routing state", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, sessions, chat } = yield* setupReflex()
+    const permission = yield* Permission.Service
+    yield* llm.text("Parent complete")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      parts: [{ type: "text", text: "Inspect this project using a child agent" }],
+    })
+    const child = yield* sessions.create({ title: "Child", parentID: chat.id })
+    const seeded = yield* seed(child.id)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: child.id,
+      type: "tool",
+      tool: "bash",
+      callID: "child-call",
+      state: { status: "pending", input: { command: "git status" }, raw: "" },
+    })
+    yield* permission.ask({
+      sessionID: child.id,
+      permission: "bash",
+      patterns: ["git status"],
+      always: [],
+      metadata: {},
+      tool: { messageID: seeded.assistant.id, callID: "child-call" },
+      ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+    })
+    expect(http.requests.at(-1)?.state).toMatchObject({ tool: { name: "bash", arguments: { command: "git status" } } })
+    expect(Reflex.task(yield* sessions.get(child.id))).toBeUndefined()
+    expect(yield* permission.list()).toHaveLength(0)
+  }),
+)
+
+it.instance("reflex compaction continuation preserves task identity and budgets", () =>
+  Effect.gen(function* () {
+    const { http, llm, prompt, sessions, chat } = yield* setupReflex({ actions: ["retry", "finish"] })
+    const reflex = yield* Reflex.Service
+    const compaction = yield* SessionCompaction.Service
+    yield* llm.text("First")
+    yield* llm.text("Corrected")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "reflex", parts: [{ type: "text", text: "Implement a change" }] })
+    const previous = Reflex.task(yield* sessions.get(chat.id))!
+    yield* compaction.create({ sessionID: chat.id, agent: "reflex", model: ref, auto: true })
+    const history = yield* sessions.messages({ sessionID: chat.id })
+    const last = history.findLast((item) => item.info.role === "user")!
+    if (last.info.role !== "user") throw new Error("Expected user")
+    const calls = http.requests.length
+    const value = yield* reflex.start(chat.id, last.info, history)
+    expect(value).toMatchObject({ taskID: previous.taskID, turns: previous.turns, corrections: previous.corrections })
+    expect(value?.userID).toBe(last.info.id)
+    expect(http.requests).toHaveLength(calls)
+  }),
+)
+
+unix("reflex observed test failure overrides a claimed finish without replaying the tool", () =>
+  Effect.gen(function* () {
+    const { llm, prompt, sessions, chat, env } = yield* setupReflex({ actions: ["finish", "finish"] })
+    const instance = yield* TestInstance
+    yield* env.set("REFLEX_MAX_CORRECTIONS", "1")
+    yield* writeText(
+      path.join(instance.directory, "fail.test.ts"),
+      'import { test, expect } from "bun:test"; test("failure", () => expect(1).toBe(2))',
+    )
+    yield* llm.tool("bash", { command: "bun test fail.test.ts", description: "Run the failing test" })
+    yield* llm.text("Everything passed")
+    yield* llm.text("The test actually failed; no changes requested")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "reflex",
+      parts: [{ type: "text", text: "Run the tests and report the result" }],
+    })
+    const history = yield* sessions.messages({ sessionID: chat.id })
+    expect(history.flatMap((item) => item.parts).filter((part) => part.type === "tool")).toHaveLength(1)
+    expect(Reflex.checks(history)[0].exit).not.toBe(0)
+    expect(Reflex.task(yield* sessions.get(chat.id))).toMatchObject({ turns: 3, corrections: 1 })
+    const log = yield* Effect.promise(() => Bun.file(path.join(Global.Path.data, "reflex", `${chat.id}.jsonl`)).text())
+    expect(log).toContain('"fallback_reason":"observed_verification_failure"')
+    expect(log).toContain('"applied":"correction_limit"')
+  }),
+)
 
 // Loop semantics
 

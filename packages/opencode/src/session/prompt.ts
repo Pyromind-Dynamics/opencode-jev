@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Reflex } from "../reflex"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -115,6 +116,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
+    const reflex = yield* Reflex.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -1078,14 +1080,35 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    const evaluateReflex = Effect.fn("SessionPrompt.evaluateReflex")(function* (
+      sessionID: SessionID,
+      selected: Reflex.Task,
+      assistant: SessionV1.Assistant,
+    ) {
+      const history = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      const diff = yield* summary
+        .computeDiff({
+          messages: history.slice(
+            Math.max(
+              0,
+              history.findIndex((item) => item.info.id === selected.taskID),
+            ),
+          ),
+        })
+        .pipe(Effect.catch(() => Effect.succeed([])))
+      const agent = yield* agents.get(selected.agent)
+      return yield* reflex.evaluate(sessionID, selected, assistant, history, diff, agent?.steps)
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
-        let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
+          let structured: unknown
+          yield* reflex.recover(sessionID)
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
@@ -1093,9 +1116,28 @@ const layer = Layer.effect(
             Effect.provideService(Database.Service, database),
           )
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          const {
+            user: requestedUser,
+            assistant: lastAssistant,
+            finished: lastFinished,
+            tasks,
+          } = MessageV2.latest(msgs)
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!requestedUser) throw new Error("No user message found in stream. This should never happen.")
+          const selected = yield* reflex.start(sessionID, requestedUser, msgs)
+          if (requestedUser.agent === "reflex" && !selected) {
+            const latest = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+            if (latest.findLast((item) => item.info.role === "user")?.info.id !== requestedUser.id) continue
+            throw new Error("Reflex is disabled or unavailable. Select build/plan or enable Reflex.")
+          }
+          // Keep the persisted user selection as reflex; every execution concern uses this effective agent/model.
+          const lastUser = selected
+            ? {
+                ...requestedUser,
+                agent: selected.agent,
+                model: { providerID: ProviderV2.ID.make("reflex"), modelID: ModelV2.ID.make(selected.tier) },
+              }
+            : requestedUser
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1110,8 +1152,8 @@ const layer = Layer.effect(
 
           if (
             lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
+            ((selected && lastAssistant.structured !== undefined) ||
+              (!["tool-calls", "unknown"].includes(lastAssistant.finish) && !hasToolCalls)) &&
             lastAssistant.parentID === lastUser.id
           ) {
             const orphan = lastAssistantMsg?.parts.find(
@@ -1124,6 +1166,9 @@ const layer = Layer.effect(
                 tool: orphan.tool,
                 callID: orphan.callID,
               })
+            }
+            if (selected && !lastAssistant.error && !lastAssistant.summary && !orphan) {
+              if (yield* evaluateReflex(sessionID, selected, lastAssistant)) continue
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             break
@@ -1163,7 +1208,7 @@ const layer = Layer.effect(
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            yield* compaction.create({ sessionID, agent: requestedUser.agent, model: lastUser.model, auto: true })
             continue
           }
 
@@ -1176,7 +1221,13 @@ const layer = Layer.effect(
             throw error
           }
           const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
+          const reserved = selected ? yield* reflex.takeTurn(sessionID, selected, maxSteps) : undefined
+          if (selected && !reserved) {
+            const latest = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+            if (latest.findLast((item) => item.info.role === "user")?.info.id !== requestedUser.id) continue
+            break
+          }
+          const isLastStep = (reserved?.turns ?? step) >= maxSteps
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -1289,6 +1340,9 @@ const layer = Layer.effect(
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
+              if (reserved && !handle.message.error && result !== "stop") {
+                if (yield* evaluateReflex(sessionID, reserved, handle.message)) return "continue" as const
+              }
               return "break" as const
             }
 
@@ -1320,7 +1374,7 @@ const layer = Layer.effect(
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
-                agent: lastUser.agent,
+                agent: requestedUser.agent,
                 model: lastUser.model,
                 auto: true,
                 overflow: !handle.message.finish,
@@ -1328,6 +1382,11 @@ const layer = Layer.effect(
             }
             return "continue" as const
           }).pipe(
+            Effect.ensuring(
+              selected
+                ? reflex.recordTurn(sessionID, selected, handle.message, performance.now(), model.api.id)
+                : Effect.void,
+            ),
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
@@ -1601,6 +1660,7 @@ export const node = LayerNode.make({
   deps: [
     SessionStatus.node,
     Session.node,
+    Reflex.node,
     Agent.node,
     Provider.node,
     SessionProcessor.node,

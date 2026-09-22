@@ -487,6 +487,9 @@ const layer = Layer.effect(
                 : part
             yield* session.updatePart({
               ...replayPart,
+              ...(original.agent === "reflex" && replayPart.type === "text"
+                ? { metadata: { ...("metadata" in replayPart ? replayPart.metadata : {}), reflex_continuation: true } }
+                : {}),
               id: PartID.ascending(),
               messageID: replayMsg.id,
               sessionID: input.sessionID,

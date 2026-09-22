@@ -6,6 +6,7 @@ import { Deferred, Effect, Layer, Context } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Reflex } from "../reflex"
 
 export const Event = PermissionV1.Event
 
@@ -39,10 +40,17 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Permi
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
+class ReflexDeniedError extends PermissionV1.DeniedError {
+  override get message() {
+    return "Reflex denied this tool operation after evaluating the task, arguments and permission rules."
+  }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const reflex = yield* Reflex.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         void ctx
@@ -82,6 +90,10 @@ const layer = Layer.effect(
       }
 
       if (!needsAsk) return
+
+      const decision = yield* reflex.authorize(input)
+      if (decision === "allow") return
+      if (decision === "deny") return yield* new ReflexDeniedError({ ruleset: input.ruleset })
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
@@ -218,6 +230,6 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, Reflex.node] })
 
 export * as Permission from "."

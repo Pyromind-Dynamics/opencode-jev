@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ReflexConfig } from "../reflex/config"
 import os from "os"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import fuzzysort from "fuzzysort"
@@ -1442,6 +1443,52 @@ const layer = Layer.effect(
 
         // now read config providers - includes any modifications from plugin config() hook
         const configProviders = Object.entries(cfg.provider ?? {})
+        const reflex = ReflexConfig.read(yield* env.all())
+        if (reflex) {
+          // Seed capabilities/prices from the catalog; config can refine unknown models.
+          const models = Object.fromEntries(
+            ReflexConfig.tiers.flatMap((tier) => {
+              const model = Object.values(database)
+                .flatMap((provider) => Object.values(provider.models))
+                .find((model) => model.id === reflex.models[tier] || model.api.id === reflex.models[tier])
+              return model
+                ? [[tier, { ...model, id: ModelV2.ID.make(tier), providerID: ProviderV2.ID.make("reflex") }]]
+                : []
+            }),
+          )
+          database.reflex = {
+            id: ProviderV2.ID.make("reflex"),
+            name: "Reflex LLM",
+            source: "config",
+            env: ["REFLEX_LLM_API_KEY"],
+            options: {},
+            models,
+          }
+          configProviders.push([
+            "reflex",
+            {
+              ...cfg.provider?.reflex,
+              name: "Reflex LLM",
+              npm: "@ai-sdk/openai-compatible",
+              env: ["REFLEX_LLM_API_KEY"],
+              options: { ...cfg.provider?.reflex?.options, baseURL: reflex.baseURL },
+              models: Object.fromEntries(
+                ReflexConfig.tiers.map((tier) => [
+                  tier,
+                  {
+                    ...cfg.provider?.reflex?.models?.[tier],
+                    id: reflex.models[tier],
+                    name: `${tier}: ${reflex.models[tier]}`,
+                    provider: { npm: "@ai-sdk/openai-compatible", api: reflex.baseURL },
+                    limit:
+                      cfg.provider?.reflex?.models?.[tier]?.limit ??
+                      (models[tier] ? undefined : { context: 32768, output: 8192 }),
+                  },
+                ]),
+              ),
+            },
+          ])
+        }
         const disabled = new Set(cfg.disabled_providers ?? [])
         const enabled = cfg.enabled_providers ? new Set(cfg.enabled_providers) : null
 
@@ -1491,7 +1538,8 @@ const layer = Layer.effect(
           }
 
           for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-            const existingModel = parsed.models[model.id ?? modelID]
+            const existingModel =
+              parsed.models[model.id ?? modelID] ?? (providerID === "reflex" ? parsed.models[modelID] : undefined)
             const apiID = model.id ?? existingModel?.api.id ?? modelID
             const apiNpm =
               model.provider?.npm ??

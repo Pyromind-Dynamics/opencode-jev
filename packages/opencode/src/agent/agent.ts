@@ -31,6 +31,8 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Reference } from "@opencode-ai/core/reference"
 import { Location } from "@opencode-ai/core/location"
 import { PluginV2 } from "@opencode-ai/core/plugin"
+import { ReflexConfig } from "../reflex/config"
+import { Env } from "../env"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -94,6 +96,7 @@ const layer = Layer.effect(
     const skill = yield* Skill.Service
     const provider = yield* Provider.Service
     const locations = yield* LocationServiceMap.Service
+    const env = yield* Env.Service
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Agent.state")(function* (ctx) {
@@ -262,6 +265,15 @@ const layer = Layer.effect(
             ),
             prompt: PROMPT_SUMMARY,
           },
+        }
+
+        if (ReflexConfig.read(yield* env.all())) {
+          agents.reflex = {
+            ...agents.plan,
+            name: "reflex",
+            description: "Jev selects build/plan, model tier, tool permissions and bounded corrections.",
+            model: { providerID: ProviderV2.ID.make("reflex"), modelID: ModelV2.ID.make("normal") },
+          }
         }
 
         for (const [key, value] of Object.entries(cfg.agent ?? {})) {
@@ -447,7 +459,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, locationServiceMapNode],
+  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, Env.node, locationServiceMapNode],
 })
 
 export * as Agent from "./agent"
